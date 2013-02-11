@@ -1,0 +1,212 @@
+#!/usr/bin/env ruby
+
+#temporary solution, so that we don't need to install it as a gem
+$LOAD_PATH.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
+
+require 'rubygems' if RUBY_VERSION < '1.9'
+require 'rpm2gem'
+require 'optparse'
+require 'ostruct'
+require 'fileutils'
+
+# Creates a directory with unique name.
+#
+def mkdir_uniq(base)
+  name = base
+  i = 1
+  while File.exists?(name)
+    name = base + "-#{i}"
+    i += 1
+  end
+  FileUtils.mkdir(name)
+  return name
+end
+
+def crash_with(msg)
+  $stderr.puts("ERROR: #{msg}")
+  exit 1
+end
+
+def warn(msg)
+  $stderr.puts("WARNING: #{msg}")
+end
+
+def inform(msg)
+  puts(msg) if $options.verbose
+end
+
+$options = OpenStruct.new
+$options.build = true
+$options.prepare = false
+$options.verbose = false
+$options.fix_extensions = true
+
+opts = OptionParser.new do |opts|
+  opts.banner = "Usage: #{$0} [OPTIONS] RPM"
+
+  opts.on("-B", "--no-build", "Do not build the final gemfile.") do
+    $options.build = false  
+  end
+
+  opts.on("-p", "--prepare", "Create a ready-to-build directory in PWD.") do
+    $options.prepare = true
+  end
+
+  opts.on("-F", "--no-fix", "Do not attempt to fix extensions,\n"\
+                     "#{' '*37}if the library has any.") do
+    $options.fix_extensions = false
+  end
+
+  opts.on("-v", "--verbose", "Verbose mode.") do
+    $options.verbose = true
+  end
+
+  opts.on_tail("-h", "--help", "Show this help and exit.") do
+    puts opts
+    exit
+  end
+
+  opts.on_tail("--version", "Show version.") do
+    puts Rpm2Gem::VERSION
+    exit
+  end
+end
+
+files = opts.permute(ARGV)
+if files.size < 1
+  puts opts
+  exit 1
+end
+
+rpms = files.map { |f| Rpm2Gem::Rpm.new(f) }
+if (rpms.count { |r| r.source? }) > 1
+  crash_with('At most only one source RPM can be provided')
+end
+srpm = rpms.detect { |r| r.source? }
+brpms = rpms.reject { |r| r.source? }
+crash_with('At least one binary RPM must be provided') if brpms.empty?
+rep_rpm = srpm || brpms.first   # most metadata from this RPM is used
+                                # as representative
+
+inform('Preparing build directory...')
+build_dir = nil
+build_dir = mkdir_uniq("#{rep_rpm.name.gsub(/\Arubygem-/, '')}-"\
+                "#{rep_rpm.version}") if $options.prepare
+                
+begin
+  build_dir, gemspec_file = Rpm2Gem.prepare_dir(brpms, build_dir)
+rescue => ex
+  crash_with("Unable to extract required files from binary "\
+             "RPMs, reason: #{ex}")
+end
+
+if $options.prepare
+  inform("Created directory: #{build_dir}")
+else
+  at_exit { FileUtils.rm_rf(build_dir) }
+end
+
+
+inform('Setting up gemspec...')
+gemspec = Gem::Specification.load(gemspec_file)
+gemspec.instance_eval('@dependencies = []')  # a small hack
+
+gemspec.version = rep_rpm.version
+gemspec.license = rep_rpm.license
+gemspec.summary = rep_rpm.summary
+gemspec.description = rep_rpm.description.gsub(/\n/, ' ').rstrip
+gemspec.homepage = rep_rpm.url
+
+rpm_deps, rpm_bdeps =
+  if srpm then Rpm2Gem.get_deps(srpm, *brpms) else Rpm2Gem.get_deps(*brpms) end
+gem_rundeps, gem_devdeps = Rpm2Gem.translate_deps(rpm_deps, rpm_bdeps)
+
+gem_rundeps.each { |n,v| gemspec.add_runtime_dependency(n,v) }
+gem_devdeps.each { |n,v| gemspec.add_development_dependency(n,v) }
+
+inform("RPM dependencies:")
+rpm_deps.each { |n,v| inform("- #{n}#{v}") }
+inform("RPM build dependencies:")
+rpm_bdeps.each { |n,v| inform("- #{n}#{v}") }
+inform("Translated into Gem runtime dependencies:")
+gem_rundeps.each { |n,v| inform("- #{n}#{v}") }
+inform("Translated into Gem development dependencies:")
+gem_devdeps.each { |n,v| inform("- #{n}#{v}") }
+
+File.open(File.join(build_dir, 'RPM_CHANGELOG'), 'w') { |f|
+  f.write(Rpm2Gem.load_changelog(rep_rpm)) }
+File.open(File.join(build_dir, 'RPM2GEM'), 'w') do |f|
+  f.write <<EOS
+This Gem package was created using the Rpm2Gem script. For more information
+about the correctness of the package see the README of the script.
+EOS
+end
+
+
+if rep_rpm.noarch?
+  inform('No extensions detected.')
+else
+  warn('Libary seems to have extensions.')
+  if $options.fix_extensions
+    inform('Attempting to fix extensions...')
+    begin
+      raise("No SRPM provided!") if srpm.nil?
+      
+      gem_file =
+        begin
+          files = Rpm2Gem.extract_gems_from_srpm(srpm)
+          unless files.empty?
+            at_exit { FileUtils.rm_rf(File.dirname(files.first)) }
+          end
+          raise("More than one gem file found in the SRPM!") if files.size > 1
+          raise("No gem file found in the SRPM!") if files.size < 1
+          files.first
+        end
+                 
+      inform('Removing built extensions (SO files)...')
+      removed = Rpm2Gem.remove_built_so(build_dir)
+      if removed.empty?
+        inform('No files removed.')
+      else
+        inform('Removed files:')
+        removed.each { |s| inform("- #{s}") }
+      end
+      
+      inform("Retrieving source files from '#{File.basename(gem_file)}' "\
+             "found in the SRPM...")
+      imported = Rpm2Gem.import_ext_sources(gem_file, build_dir)
+      if imported.empty?
+        inform('No files retrieved.')
+      else
+        inform('Retrieved files:')
+        imported.each { |s| inform("- #{s}") }
+      end
+      
+    rescue => ex
+      warn("Could not fix extensions: #{ex}")
+    end
+  end
+end
+
+Dir.chdir(build_dir) do
+  allf = Dir.glob('**/*')
+  gemspec.files = allf.select { |f| File.file?(f) }
+  gemspec.extra_rdoc_files = gemspec.extra_rdoc_files.select { |f|
+    File.exists?(f) }
+  gemspec.extra_rdoc_files << 'RPM_CHANGELOG' << 'RPM2GEM'
+  gemspec.test_files = gemspec.test_files.select { |f| File.exists?(f) }
+end
+
+File.open(gemspec_file, 'w') { |f| f.write(gemspec.to_ruby) }
+
+if $options.build
+  inform('Building...')
+  begin
+    gem_file = Rpm2Gem.build(build_dir, gemspec_file)
+  rescue => ex
+    crash_with("Building failed, reason: #{ex}")
+  end
+  
+  FileUtils.mv(gem_file, Dir.pwd)
+  puts "Wrote: #{File.basename(gem_file)}"
+end
